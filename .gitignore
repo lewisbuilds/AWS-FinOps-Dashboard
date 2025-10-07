@@ -312,7 +312,3 @@ grafana_data/
 # Example:
 # custom_config.yaml
 # local_overrides/
-chatmodes/
-instructions/
-prompts/
-README-copilot-collections.md

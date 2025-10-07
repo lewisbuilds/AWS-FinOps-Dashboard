@@ -1,0 +1,345 @@
+name: Daily FinOps Report
+
+# Automated daily AWS cost and compliance reporting
+# Runs every day at 8 AM UTC and on manual trigger
+
+on:
+  schedule:
+    - cron: '0 8 * * *'  # Daily at 8 AM UTC
+  workflow_dispatch:  # Manual trigger
+    inputs:
+      report_type:
+        description: 'Type of report to generate'
+        required: false
+        default: 'daily'
+        type: choice
+        options:
+          - daily
+          - weekly
+          - monthly
+      send_notification:
+        description: 'Send notification to Slack/Teams'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}
+  PYTHON_VERSION: '3.11'
+  POETRY_VERSION: '1.7.1'
+
+jobs:
+  # Security and permissions validation
+  validate-permissions:
+    name: Validate AWS Permissions
+    runs-on: ubuntu-latest
+    
+    # OIDC permissions for AWS authentication
+    permissions:
+      id-token: write
+      contents: read
+      
+    outputs:
+      aws-validated: ${{ steps.validate.outputs.validated }}
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: finops-dashboard-validation
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          
+      - name: Validate AWS permissions
+        id: validate
+        run: |
+          echo "Validating AWS Cost Explorer access..."
+          
+          # Test Cost Explorer access
+          aws ce get-cost-and-usage \
+            --time-period Start=2023-01-01,End=2023-01-02 \
+            --granularity DAILY \
+            --metrics BlendedCost \
+            --query 'ResultsByTime[0].Total.BlendedCost.Amount' \
+            --output text
+          
+          echo "validated=true" >> $GITHUB_OUTPUT
+          echo "✅ AWS permissions validated successfully"
+
+  # Generate FinOps report
+  generate-report:
+    name: Generate FinOps Report
+    runs-on: ubuntu-latest
+    needs: validate-permissions
+    if: needs.validate-permissions.outputs.aws-validated == 'true'
+    
+    permissions:
+      id-token: write
+      contents: read
+      issues: write  # For creating GitHub issues if alerts are triggered
+      
+    outputs:
+      report-data: ${{ steps.generate.outputs.report-data }}
+      has-alerts: ${{ steps.generate.outputs.has-alerts }}
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: ${{ env.POETRY_VERSION }}
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          
+      - name: Cache Poetry dependencies
+        uses: actions/cache@v3
+        with:
+          path: .venv
+          key: poetry-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('**/poetry.lock') }}
+          restore-keys: |
+            poetry-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
+            
+      - name: Install dependencies
+        run: |
+          poetry install --only=main
+          
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: finops-dashboard-report
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          
+      - name: Generate FinOps report
+        id: generate
+        run: |
+          echo "Generating FinOps report..."
+          
+          # Create report generation script
+          cat > generate_report.py << 'EOF'
+          import json
+          import sys
+          import os
+          from datetime import datetime
+          from app.aws_session import AWSSessionManager
+          from app.finops import FinOpsAnalyzer
+          
+          def main():
+              try:
+                  # Initialize FinOps analyzer
+                  session_manager = AWSSessionManager()
+                  finops = FinOpsAnalyzer(session_manager)
+                  
+                  # Generate daily report
+                  report = finops.generate_daily_report()
+                  
+                  # Save report to file
+                  report_file = f"finops-report-{datetime.now().strftime('%Y-%m-%d')}.json"
+                  with open(report_file, 'w') as f:
+                      json.dump(report, f, indent=2, default=str)
+                  
+                  # Output for GitHub Actions
+                  print(f"Report saved to: {report_file}")
+                  
+                  # Check for alerts
+                  has_alerts = (
+                      report.get('summary', {}).get('daily_cost_alert', False) or
+                      report.get('summary', {}).get('compliance_alert', False) or
+                      report.get('summary', {}).get('anomaly_count', 0) > 0
+                  )
+                  
+                  # Set GitHub Actions outputs
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                      f.write(f"report-data={report_file}\n")
+                      f.write(f"has-alerts={str(has_alerts).lower()}\n")
+                  
+                  print(f"✅ Report generated successfully")
+                  print(f"📊 Total cost: ${report.get('cost_metrics', {}).get('yesterday', {}).get('total_cost', 0):.2f}")
+                  print(f"🏷️ Tag compliance: {report.get('compliance_metrics', {}).get('compliance_rate', 0):.1f}%")
+                  print(f"🚨 Alerts: {'Yes' if has_alerts else 'No'}")
+                  
+              except Exception as e:
+                  print(f"❌ Failed to generate report: {e}")
+                  sys.exit(1)
+          
+          if __name__ == "__main__":
+              main()
+          EOF
+          
+          # Run report generation
+          poetry run python generate_report.py
+          
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: finops-report-${{ github.run_number }}
+          path: finops-report-*.json
+          retention-days: 30
+          
+      - name: Create GitHub issue for alerts
+        if: steps.generate.outputs.has-alerts == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const reportFile = '${{ steps.generate.outputs.report-data }}';
+            const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
+            
+            const summary = report.summary || {};
+            const costMetrics = report.cost_metrics || {};
+            const complianceMetrics = report.compliance_metrics || {};
+            
+            let alertDetails = [];
+            
+            if (summary.daily_cost_alert) {
+              alertDetails.push(`💸 **Daily Cost Alert**: Cost threshold exceeded ($${costMetrics.yesterday?.total_cost || 0})`);
+            }
+            
+            if (summary.compliance_alert) {
+              alertDetails.push(`🏷️ **Tag Compliance Alert**: Compliance rate below 80% (${complianceMetrics.compliance_rate || 0}%)`);
+            }
+            
+            if (summary.anomaly_count > 0) {
+              alertDetails.push(`📈 **Cost Anomalies**: ${summary.anomaly_count} anomalies detected`);
+            }
+            
+            const issueBody = `
+            ## 🚨 FinOps Alert - ${new Date().toDateString()}
+            
+            **Alert Summary:**
+            ${alertDetails.join('\n')}
+            
+            **Key Metrics:**
+            - **Yesterday's Cost**: $${costMetrics.yesterday?.total_cost || 0}
+            - **Tag Compliance**: ${complianceMetrics.compliance_rate || 0}%
+            - **Anomalies Detected**: ${summary.anomaly_count || 0}
+            - **Recommendations Available**: ${summary.recommendations_count || 0}
+            
+            **Actions Required:**
+            - [ ] Review cost breakdown and identify optimization opportunities
+            - [ ] Address tag compliance issues for non-compliant resources
+            - [ ] Investigate cost anomalies and root causes
+            - [ ] Implement available cost optimization recommendations
+            
+            **Report Details:**
+            - **Generated**: ${new Date().toISOString()}
+            - **Workflow Run**: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            - **Report Artifact**: Available in workflow artifacts
+            
+            ---
+            *This issue was automatically created by the FinOps Dashboard daily report workflow.*
+            `;
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 FinOps Alert - ${new Date().toDateString()}`,
+              body: issueBody,
+              labels: ['finops', 'alert', 'automated']
+            });
+
+  # Send notifications
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [validate-permissions, generate-report]
+    if: always() && (github.event.inputs.send_notification != 'false')
+    
+    steps:
+      - name: Download report artifact
+        if: needs.generate-report.result == 'success'
+        uses: actions/download-artifact@v3
+        with:
+          name: finops-report-${{ github.run_number }}
+          
+      - name: Send Slack notification
+        if: needs.generate-report.result == 'success' && secrets.SLACK_WEBHOOK_URL
+        run: |
+          # Parse report data
+          if [ -f finops-report-*.json ]; then
+            REPORT_FILE=$(ls finops-report-*.json | head -1)
+            TOTAL_COST=$(jq -r '.cost_metrics.yesterday.total_cost // 0' "$REPORT_FILE")
+            COMPLIANCE_RATE=$(jq -r '.compliance_metrics.compliance_rate // 0' "$REPORT_FILE")
+            ANOMALY_COUNT=$(jq -r '.summary.anomaly_count // 0' "$REPORT_FILE")
+            HAS_ALERTS=$(jq -r '.summary.daily_cost_alert or .summary.compliance_alert or (.summary.anomaly_count > 0)' "$REPORT_FILE")
+          else
+            TOTAL_COST="N/A"
+            COMPLIANCE_RATE="N/A"
+            ANOMALY_COUNT="N/A"
+            HAS_ALERTS="false"
+          fi
+          
+          # Determine alert emoji
+          if [ "$HAS_ALERTS" = "true" ]; then
+            ALERT_EMOJI="🚨"
+            COLOR="danger"
+          else
+            ALERT_EMOJI="✅"
+            COLOR="good"
+          fi
+          
+          # Send Slack message
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{
+              \"attachments\": [{
+                \"color\": \"$COLOR\",
+                \"title\": \"$ALERT_EMOJI AWS FinOps Daily Report\",
+                \"title_link\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
+                \"fields\": [
+                  {
+                    \"title\": \"Yesterday's Cost\",
+                    \"value\": \"$${TOTAL_COST}\",
+                    \"short\": true
+                  },
+                  {
+                    \"title\": \"Tag Compliance\",
+                    \"value\": \"${COMPLIANCE_RATE}%\",
+                    \"short\": true
+                  },
+                  {
+                    \"title\": \"Cost Anomalies\",
+                    \"value\": \"${ANOMALY_COUNT}\",
+                    \"short\": true
+                  },
+                  {
+                    \"title\": \"Report Date\",
+                    \"value\": \"$(date +'%Y-%m-%d')\",
+                    \"short\": true
+                  }
+                ],
+                \"footer\": \"AWS FinOps Dashboard\",
+                \"ts\": $(date +%s)
+              }]
+            }" \
+            ${{ secrets.SLACK_WEBHOOK_URL }}
+            
+      - name: Notify on failure
+        if: needs.generate-report.result == 'failure'
+        run: |
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            curl -X POST -H 'Content-type: application/json' \
+              --data "{
+                \"text\": \"🔥 AWS FinOps Daily Report Failed\",
+                \"attachments\": [{
+                  \"color\": \"danger\",
+                  \"title\": \"Report Generation Failed\",
+                  \"title_link\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
+                  \"text\": \"The daily FinOps report generation failed. Please check the workflow logs for details.\",
+                  \"footer\": \"AWS FinOps Dashboard\",
+                  \"ts\": $(date +%s)
+                }]
+              }" \
+              ${{ secrets.SLACK_WEBHOOK_URL }}
+          fi
+          
+          echo "Report generation failed. Check logs for details."

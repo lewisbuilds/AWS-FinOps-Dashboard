@@ -2,7 +2,7 @@
 # Multi-stage build for optimized container size
 
 # Build stage
-FROM python:3.11-slim as builder
+FROM python:3.11-slim AS builder
 
 # Set build arguments
 ARG POETRY_VERSION=1.7.1
@@ -18,8 +18,10 @@ RUN apt-get update && apt-get install -y \
 RUN pip install poetry==$POETRY_VERSION
 
 # Configure Poetry
+# NOTE: The correct env var to force an in-project virtualenv is POETRY_VIRTUALENVS_IN_PROJECT
+# The previous value POETRY_VENV_IN_PROJECT was incorrect, causing /app/.venv not to be created
 ENV POETRY_NO_INTERACTION=1 \
-    POETRY_VENV_IN_PROJECT=1 \
+    POETRY_VIRTUALENVS_IN_PROJECT=1 \
     POETRY_CACHE_DIR=/opt/poetry-cache
 
 # Set working directory
@@ -32,7 +34,7 @@ COPY pyproject.toml poetry.lock* ./
 RUN poetry install --only=main --no-root && rm -rf $POETRY_CACHE_DIR
 
 # Production stage
-FROM python:3.11-slim as production
+FROM python:3.11-slim AS production
 
 # Create non-root user for security
 RUN groupadd -r finops && useradd -r -g finops -d /app -s /bin/bash finops

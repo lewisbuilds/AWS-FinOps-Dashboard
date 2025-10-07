@@ -32,7 +32,7 @@ jobs:
   # Security and permissions validation
   validate-permissions:
     name: Validate AWS Permissions
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     
     # OIDC permissions for AWS authentication
     permissions:
@@ -72,7 +72,7 @@ jobs:
   # Generate FinOps report
   generate-report:
     name: Generate FinOps Report
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: validate-permissions
     if: needs.validate-permissions.outputs.aws-validated == 'true'
     
@@ -251,7 +251,7 @@ jobs:
   # Send notifications
   notify:
     name: Send Notifications
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [validate-permissions, generate-report]
     if: always() && (github.event.inputs.send_notification != 'false')
     

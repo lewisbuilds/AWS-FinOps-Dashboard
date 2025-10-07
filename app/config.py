@@ -325,6 +325,29 @@ class FinOpsSettings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="before")
+    @classmethod
+    def strip_inline_comments(cls, data):  # type: ignore
+        """Sanitize raw environment values before field coercion.
+
+        Many users add inline comments in .env like:
+            RATE_LIMIT_RPS=5  # Max AWS API calls
+        Pydantic attempts to parse the entire string; this pre-processor removes the inline
+        comment portion after a '#' unless the value begins with '#'. Only applies to str values.
+        """
+        if isinstance(data, dict):
+            cleaned = {}
+            for k, v in data.items():
+                if isinstance(v, str):
+                    # Split on first '#', keep left part
+                    parts = v.split('#', 1)
+                    primary = parts[0].strip()
+                    cleaned[k] = primary
+                else:
+                    cleaned[k] = v
+            return cleaned
+        return data
+
     @property
     def required_tags_list(self) -> List[str]:
         return [t.strip() for t in self.required_tag_keys.split(",") if t.strip()]

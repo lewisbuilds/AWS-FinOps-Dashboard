@@ -3,7 +3,9 @@
 
 # Variables
 APP_NAME := aws-finops-dashboard
-DOCKER_IMAGE := $(APP_NAME):latest
+# Pin application version (keep in sync with pyproject.toml [tool.poetry] version)
+APP_VERSION := 0.1.0
+DOCKER_IMAGE := $(APP_NAME):$(APP_VERSION)
 DOCKER_DEV_IMAGE := $(APP_NAME):dev
 PORT := 8501
 DEV_PORT := 8502
@@ -97,6 +99,17 @@ docker-run: build ## Build and run application in Docker container
 		--env-file .env \
 		$(DOCKER_IMAGE)
 	@echo "$(GREEN)Container started successfully$(NC)"
+
+docker-run-profile: build ## Run container mounting host AWS credentials (uses AWS_PROFILE from .env)
+	@echo "$(BLUE)Starting container with host AWS credentials mounted...$(NC)"
+	@if not exist %USERPROFILE%\.aws ( echo "$(RED)No %USERPROFILE%\.aws directory found – aborting$(NC)" && exit 1 )
+	docker run -d \
+		--name $(APP_NAME)-profile \
+		-p $(PORT):8501 \
+		--env-file .env \
+		-v %USERPROFILE%\.aws:/app/.aws:ro \
+		$(DOCKER_IMAGE)
+	@echo "$(GREEN)Container started with mounted credentials (profile mode)$(NC)"
 
 docker-dev: build-dev ## Build and run development container with volume mounting
 	@echo "$(BLUE)Starting development Docker container...$(NC)"

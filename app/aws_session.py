@@ -8,6 +8,8 @@ validated configuration.
 import logging
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
+from pathlib import Path
+import configparser
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 from botocore.config import Config
@@ -28,6 +30,8 @@ class AWSSessionManager:
         self.credentials_cache = {}
         self.cache_expiry = None
         self.settings = get_settings()
+        # Guard to avoid repeating profile existence warnings every call
+        self._profile_validated = False
         # Resilience primitives (lazy init for thread safety simplicity)
         from .resilience import RateLimiter, CircuitBreaker  # local import to avoid cycles
         self._rate_limiter = RateLimiter(self.settings.rate_limit_rps)
@@ -102,6 +106,29 @@ class AWSSessionManager:
                     )
                 else:
                     if self.settings.aws_profile:
+                        # One‑time profile existence diagnostics (developer UX improvement)
+                        if not self._profile_validated:
+                            self._profile_validated = True
+                            try:
+                                creds_path = Path("~/.aws/credentials").expanduser()
+                                if not creds_path.exists():
+                                    self.logger.warning(
+                                        "AWS profile '%s' specified but credentials file not found at %s. If running in the container, ensure you mounted your host ~/.aws directory to /app/.aws (e.g. 'make docker-run-profile'). Falling back to provider chain if resolution fails.",
+                                        self.settings.aws_profile,
+                                        creds_path,
+                                    )
+                                else:
+                                    parser = configparser.RawConfigParser()
+                                    parser.read(creds_path)
+                                    if self.settings.aws_profile not in parser.sections():
+                                        self.logger.warning(
+                                            "AWS profile '%s' not found in %s (available sections: %s). Check the profile name or mount path.",
+                                            self.settings.aws_profile,
+                                            creds_path,
+                                            parser.sections(),
+                                        )
+                            except Exception as warn_err:  # pragma: no cover - defensive
+                                self.logger.debug(f"Profile diagnostics failed (non-fatal): {warn_err}")
                         self.logger.info(f"Using AWS profile '{self.settings.aws_profile}'")
                         self.session = boto3.Session(profile_name=self.settings.aws_profile, region_name=self.region)
                     else:

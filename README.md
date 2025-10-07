@@ -33,9 +33,42 @@ Open http://localhost:8501
 
 ## Docker Alternative
 ```bash
-docker build -t finops-dashboard .
-docker run --env-file .env -p 8501:8501 finops-dashboard
+docker build -t finops-dashboard:0.1.0 .
+docker run --rm -d -p 8501:8501 finops-dashboard:0.1.0
 ```
+
+### Using an AWS Profile (Option A)
+If you set `AWS_PROFILE` in `.env` you must mount your host AWS credentials/config into the container.
+
+Windows PowerShell:
+```powershell
+docker run --rm -d -p 8501:8501 `
+	-v "$env:UserProfile\.aws:/app/.aws:ro" `
+	--env-file .env finops-dashboard:0.1.0
+```
+
+Linux / macOS:
+```bash
+docker run --rm -d -p 8501:8501 \
+	-v $HOME/.aws:/app/.aws:ro \
+	--env-file .env finops-dashboard:0.1.0
+```
+
+Makefile helper (Windows):
+```powershell
+make docker-run-profile
+```
+
+Ensure your `~/.aws/credentials` contains the profile name you set in `.env`, e.g.:
+```
+[finops]
+role_arn = arn:aws:iam::123456789012:role/FinOpsReadRole
+source_profile = default
+region = us-east-1
+```
+
+### Container Build Notes
+The provided multi-stage `Dockerfile` uses Poetry with an in-project virtual environment (`/app/.venv`). Ensure the environment variable `POETRY_VIRTUALENVS_IN_PROJECT=1` remains set (it is already defined in the `Dockerfile`). If you previously saw an error copying `/app/.venv`, rebuild after pulling the current `Dockerfile` changes.
 
 ## AWS Requirements
 

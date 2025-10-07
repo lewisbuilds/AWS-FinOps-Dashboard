@@ -65,7 +65,7 @@ class FinOpsAnalyzer:
         )
 
     # User preference customization hooks
-    def override_required_tags(self, tags: List[str]):  # type: ignore
+    def override_required_tags(self, tags: List[str]):
         if tags:
             self.logger.debug(f"Overriding required tags: {tags}")
             self.required_tags = tags

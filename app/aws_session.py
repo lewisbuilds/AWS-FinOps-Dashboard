@@ -113,7 +113,7 @@ class AWSSessionManager:
                                 creds_path = Path("~/.aws/credentials").expanduser()
                                 if not creds_path.exists():
                                     self.logger.warning(
-                                        "AWS profile '%s' specified but credentials file not found at %s. If running in the container, ensure you mounted your host ~/.aws directory to /app/.aws (e.g. 'make docker-run-profile'). Falling back to provider chain if resolution fails.",
+                                        "AWS profile '%s' specified but credentials file not found at %s. If running in a container or remote environment, ensure your AWS credentials are accessible (e.g., by mounting your ~/.aws directory or configuring environment variables). Falling back to provider chain if resolution fails.",
                                         self.settings.aws_profile,
                                         creds_path,
                                     )

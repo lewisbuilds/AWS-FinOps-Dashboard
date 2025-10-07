@@ -13,6 +13,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Any
 import json
+import re
 
 # Import handling: when executed via `streamlit run app/streamlit_app.py` the file is
 # treated as a top-level script so relative imports (".") fail. Use absolute
@@ -20,6 +21,7 @@ import json
 from app.aws_session import AWSSessionManager, AWSSessionError  # type: ignore
 from app.finops import FinOpsAnalyzer  # type: ignore
 from app.export import generate_report  # type: ignore
+from app.user_prefs import load_prefs, save_prefs, apply_threshold_overrides, override_required_tags  # type: ignore
 
 
 # Configure logging
@@ -34,6 +36,8 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+SANITIZE_CTRL = re.compile(r"[\r\n\t\x00-\x08\x0b\x0c\x0e-\x1f]")
+
 
 @st.cache_data(ttl=3600)  # Cache for 1 hour
 def load_finops_data():
@@ -41,12 +45,35 @@ def load_finops_data():
     try:
         session_manager = AWSSessionManager()
         finops = FinOpsAnalyzer(session_manager)
+        # Apply user preference overrides (cannot be cached across users easily; safe for single-user or hashed principal context)
+        principal_arn = _get_principal_arn()
+        if principal_arn:
+            _, prefs = _load_user_prefs()
+            if prefs.get('required_tag_keys'):
+                from app.user_prefs import override_required_tags as _rt
+                finops.override_required_tags(_rt(finops.required_tags, prefs))
+            # thresholds
+            daily = prefs.get('daily_cost_warning')
+            monthly = prefs.get('monthly_cost_warning')
+            if daily is not None or monthly is not None:
+                finops.override_cost_thresholds(daily=daily if daily else None, monthly=monthly if monthly else None)
         
         # Validate AWS permissions
         permissions = session_manager.validate_permissions()
-        
+
         if not permissions['cost_explorer']:
-            st.error("❌ AWS Cost Explorer access required. Please check your IAM permissions.")
+            st.error("❌ AWS Cost Explorer access required. Missing permission: ce:GetCostAndUsage (and related Cost Explorer APIs).")
+            with st.expander("How to fix Cost Explorer access"):
+                st.markdown("""
+                **Steps:**
+                1. Ensure Cost Explorer is enabled in the payer account (Billing Console).
+                2. Attach a policy containing at least `ce:GetCostAndUsage` to the IAM user/role or assumed role.
+                3. If using a role assumption, confirm both the base principal AND target role trust policy allow the action.
+                4. Re-run: `aws ce get-cost-and-usage --time-period Start=2025-10-01,End=2025-10-02 --granularity=DAILY --metrics BlendedCost --profile $env:AWS_PROFILE` to verify.
+                """)
+            st.info("Other permission checks: organizations=%s support=%s resource_groups=%s" % (
+                permissions.get('organizations'), permissions.get('support'), permissions.get('resource_groups')
+            ))
             return None
             
         return finops
@@ -76,26 +103,87 @@ def load_finops_data():
         return None
 
 
+@st.cache_data(ttl=600)
+def _get_principal_arn() -> str:
+    try:
+        mgr = AWSSessionManager()
+        sess = mgr.get_session()
+        sts = sess.client('sts')
+        return sts.get_caller_identity().get('Arn', 'unknown')
+    except Exception:
+        return 'unknown'
+
+
+def _load_user_prefs():
+    arn = _get_principal_arn()
+    prefs = load_prefs(arn)
+    return arn, prefs
+
+
 def render_sidebar():
-    """Render sidebar with navigation and filters."""
+    """Render sidebar with navigation and filters (now preference-aware)."""
     st.sidebar.title("🏗️ AWS FinOps Dashboard")
-    
+    principal_arn = _get_principal_arn()
+    # Load preferences (not cached across sessions because user may change them)
+    arn, prefs = _load_user_prefs()
+
+    # Customization section
+    with st.sidebar.expander("⚙️ Customize Dashboard", expanded=False):
+        st.caption(f"Identity: {principal_arn.split('/')[-1] if principal_arn!='unknown' else 'anonymous'}")
+        widgets = st.multiselect(
+            "Overview Widgets",
+            ["yesterday_cost","tag_compliance","anomalies","recommendations","cost_trend","service_pie"],
+            default=prefs.get("overview_widgets", []),
+            help="Select which high-level widgets appear on the Overview page"
+        )
+        daily_override = st.number_input(
+            "Daily Cost Alert Threshold ($)",
+            min_value=0.0,
+            value=float(prefs.get('daily_cost_warning') or 0.0),
+            help="Set 0 to inherit global setting"
+        )
+        monthly_override = st.number_input(
+            "Monthly Cost Alert Threshold ($)",
+            min_value=0.0,
+            value=float(prefs.get('monthly_cost_warning') or 0.0),
+            help="Set 0 to inherit global setting"
+        )
+        tag_override = st.text_input(
+            "Required Tag Keys (comma separated)",
+            value=prefs.get('required_tag_keys') or '',
+            help="Override global required tags for your view only"
+        )
+        theme_choice = st.selectbox("Theme Preference", ["light","dark"], index=0 if prefs.get('theme')=="light" else 1)
+        default_range = st.selectbox("Default Date Range", ["Last 7 days","Last 30 days","Last 90 days"], index=["Last 7 days","Last 30 days","Last 90 days"].index(prefs.get('default_date_range','Last 7 days')))
+        if st.button("💾 Save Preferences"):
+            new_prefs = dict(prefs)
+            # Sanitize tag override & enforce max length per tag implicitly in downstream cleaner
+            safe_tag_override = SANITIZE_CTRL.sub(" ", tag_override) if tag_override else None
+            new_prefs['overview_widgets'] = widgets
+            new_prefs['daily_cost_warning'] = daily_override or None
+            new_prefs['monthly_cost_warning'] = monthly_override or None
+            new_prefs['required_tag_keys'] = safe_tag_override or None
+            new_prefs['theme'] = theme_choice
+            new_prefs['default_date_range'] = default_range
+            save_prefs(principal_arn, new_prefs)
+            st.success("Preferences saved. Reload the page to apply threshold / tag changes.")
+
     # Navigation
     page = st.sidebar.selectbox(
         "📊 Dashboard Pages",
         ["Overview", "Cost Analysis", "Tag Compliance", "Anomalies", "Recommendations", "Reports", "Health"]
     )
-    
+
     st.sidebar.markdown("---")
-    
-    # Date range selector
-    st.sidebar.subheader("📅 Time Period")
-    
+
+    # Date range selector (respect default preference when first load)
+    preset_default = prefs.get('default_date_range','Last 7 days')
     date_range = st.sidebar.selectbox(
         "Select Range",
-        ["Last 7 days", "Last 30 days", "Last 90 days", "Custom"]
+        ["Last 7 days", "Last 30 days", "Last 90 days", "Custom"],
+        index=["Last 7 days", "Last 30 days", "Last 90 days", "Custom"].index(preset_default) if preset_default in ["Last 7 days","Last 30 days","Last 90 days"] else 0
     )
-    
+
     if date_range == "Custom":
         start_date = st.sidebar.date_input("Start Date", value=datetime.now().date() - timedelta(days=30))
         end_date = st.sidebar.date_input("End Date", value=datetime.now().date())
@@ -103,124 +191,120 @@ def render_sidebar():
         days = {"Last 7 days": 7, "Last 30 days": 30, "Last 90 days": 90}[date_range]
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=days)
-    
+
     st.sidebar.markdown("---")
-    
+
     # Filters
     st.sidebar.subheader("🔍 Filters")
-    
-    # Service filter
+
     services = st.sidebar.multiselect(
         "AWS Services",
         ["Amazon EC2", "Amazon S3", "Amazon RDS", "AWS Lambda", "Amazon ECS", "All"],
         default=["All"]
     )
-    
-    # Account filter (if multi-account)
+
     accounts = st.sidebar.multiselect(
         "AWS Accounts",
         ["Production", "Staging", "Development", "All"],
         default=["All"]
     )
-    
-    return page, start_date, end_date, services, accounts
+
+    return page, start_date, end_date, services, accounts, prefs
 
 
-def render_overview_page(finops: FinOpsAnalyzer, start_date: datetime, end_date: datetime):
-    """Render overview dashboard page."""
+def render_overview_page(finops: FinOpsAnalyzer, start_date: datetime, end_date: datetime, prefs: dict):
+    """Render overview dashboard page honoring user widget preferences."""
     st.title("📊 AWS FinOps Overview")
-    
-    # Get daily report data
+    widgets = prefs.get('overview_widgets', [])
+
     with st.spinner("Loading FinOps data..."):
         report = finops.generate_daily_report()
-    
+
     if 'error' in report:
         st.error(f"❌ Failed to load data: {report['error']}")
         return
-    
+
     # Key metrics row
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
+    metric_cols = []
+    metric_map = []  # (id, col)
+    if any(w in widgets for w in ["yesterday_cost","tag_compliance","anomalies","recommendations"]):
+        base_cols = st.columns(4)
+        metric_cols = base_cols
+    else:
+        base_cols = []
+
+    col_iter = iter(metric_cols)
+
+    if "yesterday_cost" in widgets:
+        col = next(col_iter)
         yesterday_cost = report['cost_metrics'].get('yesterday', {}).get('total_cost', 0)
-        st.metric(
+        col.metric(
             "💸 Yesterday's Cost",
             f"${yesterday_cost:.2f}",
             delta=f"{report['cost_metrics'].get('week_comparison', {}).get('change_percentage', 0):.1f}%"
         )
-    
-    with col2:
+    if "tag_compliance" in widgets:
+        col = next(col_iter)
         compliance_rate = report['compliance_metrics'].get('compliance_rate', 0)
-        st.metric(
+        col.metric(
             "🏷️ Tag Compliance",
             f"{compliance_rate:.1f}%",
             delta=f"{100 - compliance_rate:.1f}% to target" if compliance_rate < 100 else "✅ Target met"
         )
-    
-    with col3:
+    if "anomalies" in widgets:
+        col = next(col_iter)
         anomaly_count = report['summary'].get('anomaly_count', 0)
-        st.metric(
+        col.metric(
             "🚨 Cost Anomalies",
             str(anomaly_count),
             delta="Detected this week"
         )
-    
-    with col4:
+    if "recommendations" in widgets:
+        col = next(col_iter)
         rec_count = report['summary'].get('recommendations_count', 0)
-        st.metric(
+        col.metric(
             "💡 Recommendations",
             str(rec_count),
             delta="Available"
         )
-    
-    # Charts row
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("📈 Cost Trend (Last 7 Days)")
-        
-        # Mock trend data for demonstration
-        dates = [datetime.now().date() - timedelta(days=i) for i in range(7, 0, -1)]
-        costs = [yesterday_cost * (0.8 + 0.4 * (i % 3) / 2) for i in range(7)]
-        
-        trend_df = pd.DataFrame({
-            'Date': dates,
-            'Cost': costs
-        })
-        
-        fig = px.line(trend_df, x='Date', y='Cost', 
-                     title="Daily AWS Costs",
-                     line_shape='spline')
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        st.subheader("🎯 Service Cost Breakdown")
-        
-        service_data = report['cost_metrics'].get('yesterday', {}).get('service_breakdown', {})
-        if service_data:
-            services_df = pd.DataFrame([
-                {'Service': k, 'Cost': v} for k, v in service_data.items()
-            ]).sort_values('Cost', ascending=False).head(10)
-            
-            fig = px.pie(services_df, values='Cost', names='Service',
-                        title="Top 10 Services by Cost")
+
+    # Charts
+    chart_cols = st.columns(2)
+    if "cost_trend" in widgets:
+        with chart_cols[0]:
+            st.subheader("📈 Cost Trend (Last 7 Days)")
+            dates = [datetime.now().date() - timedelta(days=i) for i in range(7, 0, -1)]
+            yesterday_cost = report['cost_metrics'].get('yesterday', {}).get('total_cost', 0)
+            costs = [yesterday_cost * (0.8 + 0.4 * (i % 3) / 2) for i in range(7)]
+            trend_df = pd.DataFrame({'Date': dates,'Cost': costs})
+            fig = px.line(trend_df, x='Date', y='Cost', title="Daily AWS Costs", line_shape='spline')
             fig.update_layout(height=400)
             st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No service breakdown data available")
-    
-    # Alerts section
+    if "service_pie" in widgets:
+        with chart_cols[1]:
+            st.subheader("🎯 Service Cost Breakdown")
+            service_data = report['cost_metrics'].get('yesterday', {}).get('service_breakdown', {})
+            if service_data:
+                services_df = pd.DataFrame([
+                    {'Service': k, 'Cost': v} for k, v in service_data.items()
+                ]).sort_values('Cost', ascending=False).head(10)
+                fig = px.pie(services_df, values='Cost', names='Service', title="Top 10 Services by Cost")
+                fig.update_layout(height=400)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No service breakdown data available")
+
+    # Alerts
     st.subheader("🚨 Active Alerts")
-    
     alerts = []
     if report['summary'].get('daily_cost_alert'):
         alerts.append({"type": "warning", "message": "Daily cost threshold exceeded"})
     if report['summary'].get('compliance_alert'):
         alerts.append({"type": "error", "message": "Tag compliance below 80%"})
-    if anomaly_count > 0:
+    anomaly_count = report['summary'].get('anomaly_count', 0)
+    if anomaly_count > 0 and "anomalies" in widgets:
         alerts.append({"type": "info", "message": f"{anomaly_count} cost anomalies detected"})
-    
+
     if alerts:
         for alert in alerts:
             if alert["type"] == "warning":
@@ -570,6 +654,7 @@ def render_health_page():
     try:
         mgr = AWSSessionManager()
         diag = mgr.diagnose_credentials()
+        perms = mgr.validate_permissions()
         strategy = diag.get("auth_strategy")
         color = {
             "assume_role": "green" if (diag.get("base_chain_has_credentials") or diag.get("has_static_keys")) else "red",
@@ -579,6 +664,10 @@ def render_health_page():
         }.get(strategy, "red")
         st.markdown(f"**Auth Strategy:** <span style='color:{color}'>{strategy}</span>", unsafe_allow_html=True)
         st.json({k: v for k, v in diag.items() if k != "remediation"})
+        st.subheader("Permissions Snapshot")
+        st.json(perms)
+        if not perms.get('cost_explorer'):
+            st.warning("Cost Explorer access missing: add ce:GetCostAndUsage and ensure service is enabled.")
         remediation = diag.get("remediation") or []
         if remediation:
             st.subheader("Remediation Suggestions")
@@ -593,23 +682,14 @@ def render_health_page():
 
 
 def main():
-    """Main Streamlit application."""
-    # Initialize FinOps analyzer
     finops = load_finops_data()
-    
     if finops is None:
         st.stop()
-    
-    # Render sidebar and get selections
-    page, start_date, end_date, services, accounts = render_sidebar()
-    
-    # Convert dates to datetime objects
+    page, start_date, end_date, services, accounts, prefs = render_sidebar()
     start_datetime = datetime.combine(start_date, datetime.min.time())
     end_datetime = datetime.combine(end_date, datetime.min.time())
-    
-    # Render selected page
     if page == "Overview":
-        render_overview_page(finops, start_datetime, end_datetime)
+        render_overview_page(finops, start_datetime, end_datetime, prefs)
     elif page == "Cost Analysis":
         render_cost_analysis_page(finops, start_datetime, end_datetime)
     elif page == "Tag Compliance":
@@ -621,10 +701,7 @@ def main():
     elif page == "Reports":
         render_reports_page(finops)
     elif page == "Health":
-        # Health page can show even if finops failed earlier, but here finops exists.
         render_health_page()
-    
-    # Footer
     st.markdown("---")
     st.markdown("**AWS FinOps Dashboard** - Built with ❤️ using Streamlit and AWS APIs")
 

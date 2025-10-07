@@ -1,0 +1,37 @@
+name: Security Audit
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  pull_request:
+    paths:
+      - 'pyproject.toml'
+      - 'poetry.lock'
+      - 'requirements.txt'
+  workflow_dispatch:
+
+jobs:
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install poetry
+        run: pip install poetry
+      - name: Export requirements
+        run: poetry export -f requirements.txt --output requirements-export.txt --without-hashes
+      - name: Install pip-audit
+        run: pip install pip-audit
+      - name: Run pip-audit
+        run: pip-audit -r requirements-export.txt --format cyclonedx-json --output pip-audit-report.json || true
+      - name: Upload audit report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: pip-audit-report.json
+      - name: Fail on critical vulns
+        run: python -c "import json,sys;d=json.load(open('pip-audit-report.json'));v=d.get('vulnerabilities',[]);c=[x for x in v if any(r.get('severity')=='critical' for r in x.get('ratings',[]))];(print(f'Found {len(c)} critical vulnerabilities') or sys.exit(1)) if c else print('No critical vulnerabilities found')"

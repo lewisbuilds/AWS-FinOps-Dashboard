@@ -1,4 +1,126 @@
-A comprehensive **AWS Financial Operations (FinOps) Dashboard** that provides real-time cost monitoring, tag compliance tracking, anomaly detection, and optimization recommendations. Built with Python, Streamlit, and AWS APIs for enterprise-grade financial operations management.aws-finops-dashboard.
+## AWS FinOps Dashboard (Concise Overview)
+
+Real‑time AWS cost visibility, tag compliance metrics, anomaly detection, multi‑account aggregation, and scheduled reporting (CSV / JSON / Excel + optional SES email) via Streamlit.
+
+### Key Capabilities
+Cost & usage breakdown • Multi‑account (Organizations or single account mode) • Tag compliance analysis • Cost anomaly detection (Cost Explorer + advanced models) • Export & scheduled reporting • Least‑privilege IAM patterns • Optional SES email dispatch.
+
+---
+### Quick Start
+```bash
+poetry install
+cp .env.example .env  # edit for region / (optional) AWS_ROLE_ARN
+poetry run streamlit run app/streamlit_app.py
+```
+Open http://localhost:8501
+
+Docker:
+```bash
+docker build -t finops .
+docker run --env-file .env -p 8501:8501 finops
+```
+
+---
+### Minimal IAM (Central Role Example)
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Sid":"CostExplorer","Effect":"Allow","Action":[
+      "ce:GetCostAndUsage",
+      "ce:GetAnomalies",
+      "ce:GetReservationPurchaseRecommendation",
+      "ce:GetSavingsPlansPurchaseRecommendation"
+    ],"Resource":"*"},
+    {"Sid":"OrganizationsOptional","Effect":"Allow","Action":[
+      "organizations:DescribeOrganization","organizations:ListAccounts"
+    ],"Resource":"*"},
+    {"Sid":"ResourceGroups","Effect":"Allow","Action":["resource-groups:ListGroups","resource-groups:SearchResources"],"Resource":"*"},
+    {"Sid":"AssumeMember","Effect":"Allow","Action":["sts:AssumeRole","sts:GetCallerIdentity"],"Resource":"arn:aws:iam::*:role/FinOpsMemberReadOnly"}
+  ]
+}
+```
+Member role (each account): allow only `ce:GetCostAndUsage`.
+
+Set `SINGLE_ACCOUNT_MODE=true` to omit Organizations permissions entirely.
+
+See `iam/central-role-policy.json` & `iam/member-role-policy.json` for full least‑privilege policies.
+
+---
+### Core Environment Variables
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `AWS_REGION` | `us-east-1` | Primary region |
+| `AWS_ROLE_ARN` | – | Central / cross-account role (optional) |
+| `SINGLE_ACCOUNT_MODE` | `false` | Skip Organizations enumeration (reduces IAM surface) |
+| `REQUIRED_TAG_KEYS` | `Environment,Owner,Project,CostCenter` | Compliance tag keys |
+| `REPORT_OUTPUT_DIR` | `reports` | Export directory (path traversal guarded) |
+| `REPORT_DEFAULT_FORMATS` | `csv,json,xlsx` | Default export formats |
+| `MAX_EXCEL_ROWS` | `1000000` | Excel sheet safety cap (extra rows truncated) |
+| `SES_ENABLED` | `false` | Enable SES email send |
+| `SES_SENDER_EMAIL` | – | Verified SES sender |
+| `SES_RECIPIENT_EMAILS` | – | Comma list recipients |
+| `SUPPORT_PROBE_ENABLED` | `false` | Probe Support API (permission optional) |
+| `LOG_LEVEL` | `INFO` | Logging verbosity |
+| `REPORT_SCHEDULE_ENABLED` | `false` | Enable background scheduler |
+| `REPORT_SCHEDULE_CRON` | `0 2 * * *` | Cron (UTC) |
+| `REPORT_SCHEDULE_TIMEZONE` | `UTC` | Scheduler timezone |
+
+Additional tunables (see `app/config.py`): anomaly thresholds, cache TTLs, rate limiting, etc.
+
+---
+### Programmatic Report Generation
+```python
+from app.export import generate_report
+from app.finops import FinOpsAnalyzer
+
+res = generate_report(FinOpsAnalyzer(), formats=["csv","json"], last_n_days=7, email=False)
+print(res["files"])  # written export paths
+```
+
+Enable scheduler: set `REPORT_SCHEDULE_ENABLED=true` and call `init_scheduler()` (see `app/scheduler.py`).
+
+---
+### Security / Hardening Highlights
+- Single‑account mode to reduce IAM footprint
+- Optional Support API probe disabled by default (`SUPPORT_PROBE_ENABLED`)
+- JSON/CSV/XLSX export sanitization (neutralizes leading formula characters)
+- Path traversal safeguards on report output directory
+- Randomized report filenames & Excel row truncation summary sheet
+- CI dependency scan with `pip-audit` (`.github/workflows/security-audit.yml`)
+
+---
+### Troubleshooting (Credentials)
+| Issue | Likely Cause | Fix |
+|-------|--------------|-----|
+| AssumeRole pre-flight failed | No base creds for provided role | Set `AWS_PROFILE` & login (SSO) or remove role |
+| AccessDenied Cost Explorer | Missing CE actions | Attach policy containing `ce:GetCostAndUsage` etc. |
+| Organizations calls failing | In single account only | Set `SINGLE_ACCOUNT_MODE=true` |
+| SES send fails | Unverified sender / sandbox | Verify identities, set `SES_REGION` |
+
+Health tab (UI) shows `auth_strategy`, role, and remediation guidance.
+
+---
+### Testing & Dev
+```bash
+poetry run pytest
+make lint
+make format
+```
+
+---
+### Changelog Snippets (Security Additions)
+- Added least‑privilege policy files under `iam/`
+- Added `SINGLE_ACCOUNT_MODE` & `SUPPORT_PROBE_ENABLED` toggles
+- Added recursive JSON export sanitization
+- Added security audit workflow (pip-audit) failing on critical CVEs
+
+---
+### License
+MIT – see `LICENSE`.
+
+---
+Accessibility considered; please still validate with manual tooling (headings order, keyboard navigation, contrast).
 
 
 
@@ -176,7 +298,18 @@ AssumeRole pre-flight failed: no base credentials
 AWS initialization failed: No base credentials available to assume role
 ```
 
-### Recommended (AWS SSO)
+### Recommended (Profile First Approach)
+You can supply credentials via any named profile (which itself may be SSO‑backed). Set `AWS_PROFILE` and (optionally) `AWS_ROLE_ARN` if you need cross‑account read access.
+
+```powershell
+$env:AWS_PROFILE = "finops"      # profile already configured via 'aws configure sso' or static creds
+# Optional role assumption
+$env:AWS_ROLE_ARN = "arn:aws:iam::123456789012:role/FinOpsDashboardReadOnly"
+```
+
+If the profile already grants Cost Explorer & Tagging permissions, omit `AWS_ROLE_ARN`.
+
+### AWS SSO (Creating the Profile)
 ```powershell
 aws configure sso
 aws sso login --profile finops-sso
@@ -184,11 +317,8 @@ $env:AWS_PROFILE = "finops-sso"   # (Or add to your shell profile)
 ```
 Then keep `AWS_ROLE_ARN` in `.env` if you need cross‑account access.
 
-### Using a Named Profile (Non‑SSO)
-Configure a profile in `~/.aws/credentials` / `~/.aws/config` and set:
-```powershell
-$env:AWS_PROFILE = "myprofile"
-```
+### Using a Static Shared Credentials Profile (Non‑SSO)
+Define a profile in `~/.aws/credentials` then set `AWS_PROFILE`.
 
 ### Static Keys (Development Only)
 Uncomment and populate in `.env`:
@@ -405,7 +535,7 @@ aws-finops-dashboard/
 
 
 
-└─ .github/
+└── .github/
 
 
 
@@ -729,7 +859,11 @@ import pandas as pd
 
 
 
-### 2. Install Dependencies    return start.isoformat(), end.isoformat()
+### 2. Install Dependencies
+
+
+
+Your AWS role/user needs the following permissions:    return start.isoformat(), end.isoformat()
 
 
 
@@ -785,7 +919,11 @@ poetry install        Metrics=["UnblendedCost"],
 
 
 
-Your AWS role/user needs the following permissions:    # Flatten results
+- **Cost Explorer**: `ce:GetCostAndUsage`, `ce:GetAnomalies`, `ce:GetReservationPurchaseRecommendation`, `ce:GetSavingsPlansRecommendation`
+
+- **Tagging**: `tag:GetResources`
+
+- **STS**: `sts:AssumeRole` (for cross-account access)    # Flatten results
 
 
 
@@ -873,7 +1011,7 @@ Your AWS role/user needs the following permissions:    # Flatten results
 
 
 
-    }    tag = session.client("resourcegroupstaggingapi")
+    tag = session.client("resourcegroupstaggingapi")
 
 
 
@@ -1337,7 +1475,7 @@ self.cost_thresholds = {  id-token: write   # for OIDC
 
 
 
-3. **Create IAM Role for GitHub Actions:**          pip install -r requirements.txt
+3. **Create IAM Role for GitHub Actions:**
 
 
 
@@ -2287,3 +2425,66 @@ When `email=True` and SES is enabled & configured, attachments are added until t
 - UI trigger (Streamlit button) for ad-hoc generation
 
 > NOTE: This section was added with accessibility in mind; review formatting & run manual accessibility checks (e.g., headings order, contrast in your published medium).
+
+### Permissions Self-Check (CLI)
+Run an automated probe of required AWS APIs (Cost Explorer, Organizations, Tagging, Support) and exit non-zero if critical cost permissions are missing. Useful for CI gating before deploying or starting scheduled jobs.
+
+```bash
+poetry run python scripts/permissions_check.py
+# or
+python scripts/permissions_check.py
+```
+Sample output:
+```json
+{
+  "status": "ok",
+  "critical_missing": [],
+  "permissions": {
+    "cost_explorer": true,
+    "organizations": true,
+    "support": false,
+    "resource_groups": true
+  },
+  "region": "us-east-1",
+  "auth_strategy": "profile"
+}
+```
+If Cost Explorer permission is missing you will instead see:
+```json
+{
+  "status": "incomplete",
+  "critical_missing": ["cost_explorer"],
+  ...
+}
+```
+Exit codes: 0 = all good, 1 = critical missing, 2 = unexpected runtime/auth error.
+
+### Minimal IAM Policy File
+A curated starter policy (read-only) is available in `iam/finops-minimal-policy.json`. Attach it (or merge into an existing role) and ensure Cost Explorer is enabled in the AWS console. Add SES actions only if you enable email features. Tighten with resource scoping / condition keys per your governance.
+## 🎨 User Customization (New)
+The dashboard now supports per-user (per AWS principal ARN) preferences stored locally under `.finops_prefs/`:
+
+| Feature | Description | How to Configure |
+|---------|-------------|------------------|
+| Overview Widgets | Choose which KPI widgets & charts appear | Sidebar → ⚙️ Customize Dashboard → Overview Widgets |
+| Personalized Thresholds | Override daily / monthly cost alert triggers | Sidebar customization inputs (set 0 to inherit global) |
+| Required Tag Keys | Override global required tag list for compliance view | Sidebar text input (comma list) |
+| Theme Preference | Light / Dark (applies to Streamlit theme toggle) | Sidebar select (requires reload to fully apply) |
+| Default Date Range | Auto-selected range on load | Sidebar select |
+| Persistence | Preferences saved to hashed file per principal | Automatic on Save |
+
+Preferences are hashed by principal ARN (first 16 hex chars of SHA-256) to avoid leaking full ARNs in filenames.
+
+Example preference file path:
+```
+.finops_prefs/prefs-<hash>.json
+```
+
+To reset preferences, delete the corresponding file; defaults will be regenerated on next load.
+
+Roadmap enhancements:
+* Saved named filter sets
+* Organization-wide enforced baseline vs. personal overrides
+* Export/import preference bundles
+
+---

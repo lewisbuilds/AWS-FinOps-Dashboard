@@ -65,7 +65,7 @@ class AWSSessionManager:
         try:
             if self.role_arn:
                 # Pre-flight guard: ensure base credentials exist to perform STS AssumeRole
-                base = boto3.Session()
+                base = boto3.Session(profile_name=self.settings.aws_profile) if self.settings.aws_profile else boto3.Session()
                 # Some test doubles may not implement get_credentials; handle gracefully
                 base_creds = None
                 try:
@@ -101,8 +101,12 @@ class AWSSessionManager:
                         region_name=self.region,
                     )
                 else:
-                    self.logger.info("Using default AWS credential provider chain")
-                    self.session = boto3.Session(region_name=self.region)
+                    if self.settings.aws_profile:
+                        self.logger.info(f"Using AWS profile '{self.settings.aws_profile}'")
+                        self.session = boto3.Session(profile_name=self.settings.aws_profile, region_name=self.region)
+                    else:
+                        self.logger.info("Using default AWS credential provider chain")
+                        self.session = boto3.Session(region_name=self.region)
                 
             # Validate session by making a simple API call
             sts_client = self.session.client('sts', config=self.config)
@@ -292,12 +296,13 @@ class AWSSessionManager:
             pass
             
         try:
-            # Test Support access
-            support_client = self.get_client('support', region_name='us-east-1')
-            support_client.describe_services()
-            permissions['support'] = True
+            # Test Support access (optional probe)
+            if getattr(self.settings, 'support_probe_enabled', False):
+                support_client = self.get_client('support', region_name='us-east-1')
+                support_client.describe_services()
+                permissions['support'] = True
         except Exception:
-            # Broadened to any exception because some environments may not have Support API access
+            # Silently ignore if probe disabled or inaccessible
             pass
             
         try:

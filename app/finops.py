@@ -63,6 +63,18 @@ class FinOpsAnalyzer:
             iforest_contamination=self.settings.anomaly_iforest_contamination,
             method=self.settings.anomaly_method,
         )
+
+    # User preference customization hooks
+    def override_required_tags(self, tags: List[str]):  # type: ignore
+        if tags:
+            self.logger.debug(f"Overriding required tags: {tags}")
+            self.required_tags = tags
+
+    def override_cost_thresholds(self, daily: Optional[float] = None, monthly: Optional[float] = None):
+        if daily is not None:
+            self.cost_thresholds['daily_warning'] = daily
+        if monthly is not None:
+            self.cost_thresholds['monthly_warning'] = monthly
     
     @cached("cost", ttl_resolver=lambda s: s.cache_ttls["cost"])
     def get_cost_and_usage(self,

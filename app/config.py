@@ -4,7 +4,7 @@ from decimal import Decimal
 import re
 import logging
 import boto3
-from pydantic import Field, field_validator, model_validator, ConfigDict
+from pydantic import Field, field_validator, model_validator, ConfigDict, AliasChoices
 
 # Pydantic v2 moved BaseSettings to pydantic_settings. Provide flexible import so
 # tests still run if an older v1 environment is used (though project targets v2).
@@ -23,11 +23,17 @@ class FinOpsSettings(BaseSettings):
     - Retained backwards-compatible semantics for list-like comma separated fields.
     """
 
-    aws_region: str = Field(default="us-east-1", validation_alias="AWS_DEFAULT_REGION")
+    # Accept both AWS_REGION and AWS_DEFAULT_REGION; AWS_REGION takes precedence if both set.
+    aws_region: str = Field(
+        default="us-east-1",
+        validation_alias=AliasChoices("AWS_REGION", "AWS_DEFAULT_REGION"),
+        description="Primary AWS region for API calls"
+    )
     assume_role_arn: Optional[str] = Field(default=None, validation_alias="AWS_ROLE_ARN")
     aws_access_key_id: Optional[str] = Field(default=None, validation_alias="AWS_ACCESS_KEY_ID")
     aws_secret_access_key: Optional[str] = Field(default=None, validation_alias="AWS_SECRET_ACCESS_KEY")
     aws_session_token: Optional[str] = Field(default=None, validation_alias="AWS_SESSION_TOKEN")
+    aws_profile: Optional[str] = Field(default=None, validation_alias="AWS_PROFILE", description="Shared credentials / SSO profile name")
 
     required_tag_keys: str = Field(default="Environment,Owner,Project,CostCenter", validation_alias="REQUIRED_TAG_KEYS")
 
@@ -136,6 +142,15 @@ class FinOpsSettings(BaseSettings):
     max_excel_rows: int = Field(
         default=1_000_000, validation_alias="MAX_EXCEL_ROWS", ge=1, le=1_048_576,
         description="Safety cap for rows written to Excel workbooks"
+    )
+    # Mode / feature toggles
+    single_account_mode: bool = Field(
+        default=False, validation_alias="SINGLE_ACCOUNT_MODE",
+        description="If true, skip AWS Organizations enumeration and treat current account as sole scope"
+    )
+    support_probe_enabled: bool = Field(
+        default=False, validation_alias="SUPPORT_PROBE_ENABLED",
+        description="If true, perform Support API permission probe (DescribeServices); off reduces IAM surface"
     )
 
     @field_validator("aws_region")
@@ -279,12 +294,34 @@ class FinOpsSettings(BaseSettings):
                 raise ValueError(f"Invalid recipient email format: {e}")
         return ",".join(parts) if parts else None
 
+    @field_validator("report_output_dir")
+    def validate_report_output_dir(cls, v: str) -> str:  # type: ignore
+        # Disallow path traversal components. Allow relative or absolute paths without '..'.
+        from pathlib import Path
+        p = Path(v)
+        if any(part == ".." for part in p.parts):
+            raise ValueError("report_output_dir must not contain path traversal components ('..')")
+        # Optionally enforce single nested depth (soft); skip for absolute.
+        return v
+
     @model_validator(mode="after")
     def validate_auth_method(self):
-        # Allow falling back to default boto3 credential provider chain for local/testing scenarios
-        if not self.assume_role_arn and not (self.aws_access_key_id and self.aws_secret_access_key):
-            logging.getLogger(__name__).warning(
-                "No explicit AWS auth provided (AWS_ROLE_ARN or static keys). Falling back to default provider chain."
+        # Provide contextual logging about authentication strategy without spamming for valid profile usage.
+        logger = logging.getLogger(__name__)
+        has_role = bool(self.assume_role_arn)
+        has_static = bool(self.aws_access_key_id and self.aws_secret_access_key)
+        has_profile = bool(self.aws_profile)
+        if has_role:
+            # Role assumption path will still rely on base creds (could be profile, env, SSO, etc.)
+            logger.debug("Auth strategy: assume_role (role_arn set)")
+        elif has_static:
+            logger.debug("Auth strategy: static_keys (AWS_ACCESS_KEY_ID / SECRET provided)")
+        elif has_profile:
+            # Previously this produced a fallback warning; now treat as a first-class explicit strategy.
+            logger.debug(f"Auth strategy: profile ('{self.aws_profile}')")
+        else:
+            logger.warning(
+                "No explicit AWS auth provided (no role, profile, or static keys). Falling back to default provider chain (env vars, instance profile, SSO cache)."
             )
         return self
 

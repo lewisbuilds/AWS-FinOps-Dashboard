@@ -10,6 +10,8 @@ import os
 import io
 import json
 import logging
+import re
+import secrets
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from typing import Iterable, List, Dict, Any, Optional, Callable, Protocol, runtime_checkable
@@ -119,7 +121,26 @@ def _to_dataframe(datasets: dict) -> dict:
         })
     tag_df = pd.DataFrame(tag_rows)
 
-    return {"costs": costs_df, "anomalies": anomalies_df, "tag_compliance": tag_df}
+    # Sanitize all frames for potential spreadsheet injection vectors
+    frames = {"costs": costs_df, "anomalies": anomalies_df, "tag_compliance": tag_df}
+    return {k: _sanitize_dataframe(v) for k, v in frames.items()}
+
+def _sanitize_spreadsheet_value(val):
+    """Prefix potentially dangerous spreadsheet formula initiators to mitigate CSV/Excel injection.
+
+    Per security guidance, values beginning with =, +, -, or @ can trigger formula execution
+    when opened in spreadsheet software. We neutralize by prefixing a single quote. Only
+    applied to str instances; other types returned unchanged.
+    """
+    if isinstance(val, str) and val and val[0] in ("=", "+", "-", "@"):  # simple first‑char check
+        return "'" + val
+    return val
+
+
+def _sanitize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    return df.applymap(_sanitize_spreadsheet_value)
 
 def write_csv(datasets: dict, output_dir: str, base_name: str) -> List[str]:
     frames = _to_dataframe(datasets)
@@ -134,23 +155,43 @@ def write_csv(datasets: dict, output_dir: str, base_name: str) -> List[str]:
 def write_json(datasets: dict, output_dir: str, base_name: str, pretty: bool = True) -> List[str]:
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"{base_name}.json")
+    # Sanitize string values in nested structures to neutralize leading formula chars.
+    def _sanitize(obj):
+        if isinstance(obj, dict):
+            return {k: _sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_sanitize(v) for v in obj]
+        return _sanitize_spreadsheet_value(obj)
+    safe_datasets = _sanitize(datasets)
     with open(path, "w", encoding="utf-8") as f:
         if pretty:
-            json.dump(datasets, f, indent=2, default=str)
+            json.dump(safe_datasets, f, indent=2, default=str)
         else:
-            json.dump(datasets, f, separators=(",", ":"), default=str)
+            json.dump(safe_datasets, f, separators=(",", ":"), default=str)
     return [path]
 
 def write_excel(datasets: dict, output_dir: str, base_name: str) -> List[str]:
     frames = _to_dataframe(datasets)
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"{base_name}.xlsx")
+    settings = get_settings()
+    max_rows = getattr(settings, "max_excel_rows", 1_000_000)
     with pd.ExcelWriter(path, engine="openpyxl") as writer:  # type: ignore
         for sheet, df in frames.items():
-            # Excel sheet name limit 31 chars
             sheet_name = sheet[:31]
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
-        # Consolidated summary sheet
+            write_df = df
+            truncated = False
+            if len(write_df) > max_rows:
+                write_df = write_df.iloc[:max_rows].copy()
+                truncated = True
+            write_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            if truncated:
+                from openpyxl.utils import get_column_letter  # type: ignore
+                # Append a note sheet once if needed
+        if any(len(df) > max_rows for df in frames.values()):
+            import pandas as _pd
+            note = _pd.DataFrame([[f"Truncated to {max_rows} rows per sheet for safety"]], columns=["notice"])
+            note.to_excel(writer, sheet_name="_truncated", index=False)
         summary_df = pd.DataFrame([
             {
                 "period_start": datasets["consolidated"]["period_start"],
@@ -230,7 +271,7 @@ def generate_report(
     start_d, end_d, label = resolve_date_range(start, end, last_n_days, preset)
     datasets = build_datasets(analyzer, start_d, end_d)
     output_dir = output_dir or getattr(settings, "report_output_dir", "./exports")
-    base_name = f"finops_report_{label}_{datetime.utcnow().strftime('%Y%m%d_%H%M%SZ')}"
+    base_name = f"finops_report_{label}_{datetime.utcnow().strftime('%Y%m%d_%H%M%SZ')}_{secrets.token_hex(3)}"
 
     written: List[str] = []
     file_meta: List[Dict[str, Any]] = []

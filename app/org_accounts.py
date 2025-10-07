@@ -51,6 +51,16 @@ def list_org_accounts(session_manager: AWSSessionManager) -> List[Dict[str, str]
     Returns list of dicts: { 'id': account_id, 'name': name, 'email': email }.
     """
     settings = get_settings()
+    # Single-account mode short-circuit: derive current caller identity only.
+    if getattr(settings, "single_account_mode", False):
+        try:
+            sess = session_manager.get_session()
+            sts = sess.client("sts", config=session_manager.config)
+            ident = sts.get_caller_identity()
+            acct_id = ident.get("Account")
+            return [{"id": acct_id, "name": "current", "email": None}]
+        except Exception:
+            return []
     cached = _account_cache.get()
     if cached is not None:
         return cached

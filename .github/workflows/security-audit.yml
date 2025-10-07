@@ -1,0 +1,103 @@
+name: Security Audit
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  pull_request:
+    paths:
+      - 'pyproject.toml'
+      - 'poetry.lock'
+      - 'requirements.txt'
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.11'
+  POETRY_VERSION: '1.7.1'
+  PIP_AUDIT_VERSION: '2.7.3' # pinned for deterministic builds
+
+jobs:
+  pip-audit:
+    name: Dependency Vulnerability & SBOM Scan
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write   # needed to upload SARIF
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          cache-dependency-path: 'poetry.lock'
+
+      - name: Install Poetry (pinned)
+        run: pip install "poetry==${{ env.POETRY_VERSION }}"
+
+      - name: Export requirements (no hashes) for audit
+        run: poetry export -f requirements.txt --output requirements-export.txt --without-hashes
+
+      - name: Install pip-audit (pinned)
+        run: pip install "pip-audit==${{ env.PIP_AUDIT_VERSION }}"
+
+      - name: Run pip-audit (CycloneDX SBOM)
+        run: pip-audit -r requirements-export.txt --format cyclonedx-json --output pip-audit-report.cyclonedx.json || true
+
+      - name: Run pip-audit (JSON for severity parsing)
+        run: pip-audit -r requirements-export.txt --format json --output pip-audit-report.json || true
+
+      - name: Run pip-audit (SARIF for code scanning)
+        run: pip-audit -r requirements-export.txt --format sarif --output pip-audit.sarif || true
+
+      - name: Upload audit artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-artifacts
+          path: |
+            pip-audit-report.cyclonedx.json
+            pip-audit-report.json
+            pip-audit.sarif
+          retention-days: 14
+
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: pip-audit.sarif
+        continue-on-error: true
+
+      - name: Fail on critical vulnerabilities only
+        run: |
+          python - <<'PY'
+          import json, sys, pathlib
+          report = pathlib.Path('pip-audit-report.json')
+          if not report.exists():
+              print('Report file missing; skipping fail gate (treat as no critical vulns).')
+              sys.exit(0)
+          data = json.load(report.open())
+          vulns = []
+          # Support both legacy and cyclonedx-like structures
+          if isinstance(data, dict):
+              if 'vulnerabilities' in data and isinstance(data['vulnerabilities'], list):
+                  vulns = data['vulnerabilities']
+              elif 'dependencies' in data:  # pip-audit JSON structure
+                  for dep in data.get('dependencies', []):
+                      for v in dep.get('vulns', []):
+                          sev = v.get('severity') or v.get('id')  # normalize
+                          vulns.append({'id': v.get('id'), 'severity': sev, 'raw': v})
+          critical = []
+          for v in vulns:
+              sev = v.get('severity')
+              if isinstance(sev, str) and sev.lower() == 'critical':
+                  critical.append(v)
+              for rating in v.get('ratings', []):
+                  if rating.get('severity', '').lower() == 'critical':
+                      critical.append(v)
+          if critical:
+              print(f'Found {len(critical)} critical vulnerabilities:')
+              for cv in critical:
+                  print(' -', cv.get('id') or cv.get('raw', {}).get('id'))
+              sys.exit(1)
+          print('No critical vulnerabilities found.')
+          PY

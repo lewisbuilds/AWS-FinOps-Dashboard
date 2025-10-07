@@ -155,7 +155,7 @@ class FinOpsSettings(BaseSettings):
 
     @field_validator("aws_region")
     def validate_region(cls, v: str) -> str:
-        if not re.match(r"^[a-z]{2}-[a-z]+-\d$", v):
+        if not re.match(r'^[a-z0-9][a-z0-9\-]*[a-z0-9]$', v):
             raise ValueError(f"Invalid AWS region format: {v}")
         try:
             known = boto3.session.Session().get_available_regions("ec2")

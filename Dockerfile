@@ -19,7 +19,6 @@ RUN pip install poetry==$POETRY_VERSION
 
 # Configure Poetry
 # NOTE: The correct env var to force an in-project virtualenv is POETRY_VIRTUALENVS_IN_PROJECT
-# The previous value POETRY_VENV_IN_PROJECT was incorrect, causing /app/.venv not to be created
 ENV POETRY_NO_INTERACTION=1 \
     POETRY_VIRTUALENVS_IN_PROJECT=1 \
     POETRY_CACHE_DIR=/opt/poetry-cache

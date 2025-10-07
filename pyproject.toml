@@ -2,7 +2,7 @@
 name = "aws-finops-dashboard"
 version = "0.1.0"
 description = "Serverless FinOps dashboard for AWS cost analysis and tag compliance"
-authors = ["Richard Lewis <Richardjlew3@gmail.com>"]
+authors = ["Name <Email>"]
 readme = "README.md"
 packages = [{include = "app"}]
 
